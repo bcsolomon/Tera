@@ -1,0 +1,4 @@
+.DS_Store
+.litellm_key
+.td_creds
+.claude/
