@@ -1,0 +1,254 @@
+# Identifier Quoting and Alias Behavior — Complete Reference
+
+> Sources: SQL Fundamentals (B035-1141-111A), observed parser behavior on Teradata 20.0
+
+---
+
+## 1. Identifier Types
+
+Teradata supports two identifier forms:
+
+| Type | Syntax | Case Sensitivity | Reserved Words | Max Length |
+|---|---|---|---|---|
+| **Regular** (unquoted) | `my_table` | Case-insensitive (stored uppercase) | Cannot use reserved words | 30 chars (128 with EON) |
+| **Delimited** (double-quoted) | `"My_Table"` | Case-sensitive (stored as-written) | Can use reserved words | 30 chars (128 with EON) |
+
+### Regular Identifiers
+
+```sql
+-- These are all equivalent (case-insensitive):
+SELECT * FROM mydb.orders;
+SELECT * FROM MyDb.Orders;
+SELECT * FROM MYDB.ORDERS;
+```
+
+**Character rules:**
+- Must begin with a letter (A–Z, a–z) or underscore (`_`)
+- May contain letters, digits (0–9), underscores, dollar signs (`$`), and hash signs (`#`)
+- Cannot be a Teradata reserved word
+- Cannot contain spaces or special characters
+
+### Delimited Identifiers
+
+```sql
+-- Case is preserved exactly as written:
+SELECT * FROM "MyDb"."My Orders";   -- spaces allowed
+SELECT * FROM "mydb"."SELECT";      -- reserved word as name
+```
+
+**Character rules:**
+- Enclosed in double quotes (`"..."`)
+- May contain any character except double quotes
+- To include a double quote in the name, use two consecutive: `"My""Table"`
+- Case-sensitive — `"orders"` and `"Orders"` are different objects
+- Leading/trailing spaces are significant
+
+### When to Use Delimited Identifiers
+
+| Scenario | Required? | Example |
+|---|---|---|
+| Object name is a reserved word | Yes | `"SELECT"`, `"DATE"`, `"INDEX"` |
+| Object name contains spaces | Yes | `"My Table"` |
+| Object name contains special characters | Yes | `"order-history"` |
+| Need exact case preservation | Yes | `"myTable"` vs `"MYTABLE"` |
+| Object created with quoted name | Yes | Must reference with same quoting |
+| Standard column/table names | No | Avoid — adds complexity |
+
+---
+
+## 2. Table Aliases
+
+### Basic Alias Syntax
+
+```sql
+-- Alias without AS (Teradata standard)
+SELECT o.order_id, o.amount
+FROM mydb.orders o;
+
+-- Alias with AS (also valid)
+SELECT o.order_id, o.amount
+FROM mydb.orders AS o;
+```
+
+### Alias Scope
+
+- Aliases are valid only within the query where they are defined
+- In a JOIN, each table's alias is visible in the ON clause and SELECT list
+- Column aliases defined in SELECT are visible in QUALIFY and ORDER BY, but NOT in WHERE or HAVING
+
+```sql
+-- Column alias visible in QUALIFY
+SELECT customer_id, total_spend,
+       RANK() OVER (ORDER BY total_spend DESC) AS rnk
+FROM mydb.customers
+QUALIFY rnk <= 10;   -- OK: column alias works in QUALIFY
+
+-- Column alias NOT visible in WHERE
+SELECT amount * 1.1 AS taxed_amount
+FROM mydb.orders
+WHERE taxed_amount > 100;   -- ERROR: taxed_amount not recognized
+-- Fix: repeat the expression
+WHERE amount * 1.1 > 100;
+```
+
+---
+
+## 3. The Alias + Quoted Identifier Problem
+
+### The Problem
+
+When combining table aliases with double-quoted column identifiers, the Teradata parser can misinterpret the syntax:
+
+```sql
+-- This FAILS with Error 3706:
+SELECT cd."customer_type", cd."current_balance"
+FROM mydb.customer_data cd
+INNER JOIN mydb.Customers c ON cd."customer_id" = c."CustomerID";
+```
+
+**Error:** `3706: Syntax error: expected something between ',' and the 'cd' keyword.`
+
+### Why It Happens
+
+The parser resolves `cd."customer_type"` ambiguously. In Teradata's syntax model, `"quoted_name"."quoted_name"` is the canonical form for `database.object` or `table.column`. When a short alias like `cd` precedes a quoted identifier, the parser may fail to resolve the alias reference correctly, especially in comma-first column lists.
+
+### The Fix
+
+**Option 1: Use full table names (recommended)**
+
+```sql
+SELECT customer_data.customer_type, customer_data.current_balance
+FROM mydb.customer_data
+INNER JOIN mydb.Customers ON customer_data.customer_id = Customers.CustomerID;
+```
+
+**Option 2: Drop the double quotes (if names aren't case-sensitive or reserved)**
+
+```sql
+SELECT cd.customer_type, cd.current_balance
+FROM mydb.customer_data cd
+INNER JOIN mydb.Customers c ON cd.customer_id = c.CustomerID;
+```
+
+**Option 3: Quote the alias too**
+
+```sql
+SELECT "cd"."customer_type", "cd"."current_balance"
+FROM mydb.customer_data "cd"
+INNER JOIN mydb.Customers "c" ON "cd"."customer_id" = "c"."CustomerID";
+```
+
+### When This Problem Occurs
+
+| Pattern | Works? | Notes |
+|---|---|---|
+| `alias.column` (unquoted) | Yes | Normal usage |
+| `alias."Column"` (mixed) | **No** | Parser error 3706 |
+| `"alias"."Column"` (both quoted) | Yes | Verbose but correct |
+| `TableName."Column"` (full name) | Yes | No alias needed |
+| `TableName.Column` (both unquoted) | Yes | Simplest fix |
+
+### Real-World Example
+
+The VS Code Teradata extension generates queries with double-quoted identifiers by default:
+
+```sql
+-- Generated by VS Code Teradata extension (fails with aliases)
+SELECT
+     "customer_id"
+    ,"customer_type"
+    ,"current_balance"
+FROM "df120645"."customer_data";
+```
+
+This works fine for single-table queries. When you add a JOIN with aliases, drop the quotes or use full table names:
+
+```sql
+-- Working JOIN with full table names
+SELECT
+     Customers.FirstName
+    ,Customers.LastName
+    ,customer_data.customer_type
+    ,customer_data.current_balance
+    ,customer_data.churn_probability
+FROM df120645.customer_data
+INNER JOIN df120645.Customers
+  ON customer_data.customer_id = Customers.CustomerID;
+```
+
+---
+
+## 4. Object Naming Rules
+
+### Length Limits
+
+| Context | Max Length |
+|---|---|
+| Database, table, column, macro, view names | 30 characters (pre-EON) |
+| With Extended Object Names (EON) | 128 characters |
+| Fully qualified: `database.table.column` | Each segment has its own limit |
+
+### Name Resolution Order
+
+When an unqualified name is used, Teradata resolves it in this order:
+
+1. **Default database** (set by `DATABASE` statement or user profile)
+2. **User's login database** (for volatile tables)
+3. **SYSLIB** (for UDFs not found elsewhere)
+
+If the name is ambiguous (exists in multiple databases in scope), Error 3810 is returned.
+
+### Reserved Word Conflicts
+
+Common reserved words that cause problems when used as identifiers:
+
+| Word | Type | Workaround |
+|---|---|---|
+| `DATE` | Data type | `"DATE"` or rename to `order_date` |
+| `TIME` | Data type | `"TIME"` or rename to `event_time` |
+| `INDEX` | DDL keyword | `"INDEX"` or rename to `idx_name` |
+| `SELECT` | DML keyword | `"SELECT"` — but avoid this |
+| `VALUE` | Keyword | `"VALUE"` or rename to `val` |
+| `POSITION` | Function name | `"POSITION"` or rename |
+| `ACCOUNT` | Keyword | `"ACCOUNT"` or rename |
+
+### Cross-Database References
+
+```sql
+-- Fully qualified: database.table
+SELECT * FROM production_db.customers;
+
+-- Fully qualified with column: database.table.column
+SELECT production_db.customers.customer_id FROM production_db.customers;
+
+-- Three-part name in JOIN
+SELECT a.col1, b.col2
+FROM db1.table1 a
+JOIN db2.table2 b ON a.key = b.key;
+```
+
+---
+
+## 5. Quoting in DDL
+
+### Creating Objects with Quoted Names
+
+```sql
+-- Creates a case-sensitive table name
+CREATE TABLE mydb."MySpecialTable" (
+    "Order ID" INTEGER,
+    "Customer Name" VARCHAR(100)
+) PRIMARY INDEX ("Order ID");
+
+-- Must always reference with exact quoting:
+SELECT "Order ID", "Customer Name" FROM mydb."MySpecialTable";
+```
+
+**Warning:** Once created with quotes, the object must always be referenced with the exact same quoting and case. This makes maintenance harder and is generally discouraged.
+
+### Best Practice
+
+- Use regular (unquoted) identifiers for all new objects
+- Use underscores instead of spaces: `order_id` not `"Order ID"`
+- Avoid reserved words as names
+- Only use delimited identifiers when working with legacy objects that require them

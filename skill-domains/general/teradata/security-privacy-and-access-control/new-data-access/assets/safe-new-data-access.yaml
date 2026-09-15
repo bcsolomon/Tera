@@ -1,0 +1,362 @@
+apiVersion: loom/v1
+kind: Workflow
+metadata:
+  name: safe-new-data-access
+  description: >-
+    Governed data access onboarding with human approval gates before SQL
+    execution. Phase 1 discovers schema and classifies sensitivity (read-only).
+    Phase 2 designs roles, views, and access patterns (no tools). Phase 3
+    generates SQL (no tools). HITL gate suspends for human review of data
+    profile, access design, and generated SQL. Phase 4 executes approved SQL.
+    Phase 5 validates with read-only test queries and obtains final sign-off.
+  labels:
+    category: security-privacy-and-access-control
+    safety: hitl-gated
+    domain: new-data-access
+
+spec:
+  type: pipeline
+  initial_prompt: "{{user_request}}"
+
+  # ════════════════════════════════════════════════════════════════════
+  # WORKFLOW A — Design Pipeline (read-only / no-tool stages)
+  # Covers Skill Steps 1–11: Discovery → Design → SQL Generation
+  # ════════════════════════════════════════════════════════════════════
+
+  stages:
+    # ── Stage 1: Discovery & Sensitivity Assessment ──────────────────
+    # Skill Steps 1–6: Identify DB, enumerate tables, classify columns,
+    # recommend protection, build readiness report.
+    # TOOLS: Read-only only. No execute_sql.
+    - agent_id: nda-discovery-analyst
+      prompt_template: |
+        You are a Teradata security analyst performing data discovery and
+        sensitivity classification for a new data access request. You have
+        READ-ONLY access to the database.
+
+        Execute these steps in order:
+        1. IDENTIFY DATABASE: Use base_databaseList to confirm the target
+           database exists. If ambiguous, use base_readQuery with:
+           SELECT DatabaseName FROM DBC.DatabasesV
+           WHERE DatabaseName LIKE '%{{target}}%'
+        2. ENUMERATE TABLES: Use base_tableList to list all tables in the
+           target database. Filter to the scope the user specified.
+        3. ASSESS COLUMNS: For each in-scope table, use base_columnDescription
+           and base_readQuery to:
+           - List all columns with data types
+           - Flag potential PII: names, emails, SSN, phone, DOB, address
+           - Flag potential PCI: card numbers, CVV, expiry
+           - Flag potential PHI: diagnosis, medication, provider IDs
+           - Check for PCI combination risk (individually benign columns
+             that become sensitive together)
+        4. RECOMMEND PROTECTION: For each sensitive column, recommend:
+           - MASK: Replace with pattern (e.g., last-4 for SSN)
+           - EXCLUDE: Omit from view entirely
+           - FILTER: Row-level restriction by role
+           - ENCRYPT: Column-level encryption (note: requires UDFs)
+        5. BUILD READINESS REPORT: Compile:
+           - Database/table inventory with row counts
+           - Column sensitivity classification matrix
+           - Protection recommendations per column
+           - Data quality flags (nulls, cardinality)
+           - Existing roles and grants already in place
+
+        User request:
+        {{previous}}
+      output_schema: |
+        {
+          "type": "object",
+          "required": ["database", "tables", "sensitivity_matrix", "recommendations"],
+          "properties": {
+            "database": { "type": "string" },
+            "tables": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "row_count": { "type": "integer" },
+                  "column_count": { "type": "integer" }
+                }
+              }
+            },
+            "sensitivity_matrix": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "table": { "type": "string" },
+                  "column": { "type": "string" },
+                  "data_type": { "type": "string" },
+                  "classification": {
+                    "type": "string",
+                    "enum": ["PII", "PCI", "PHI", "PCI_COMBO", "SENSITIVE", "PUBLIC"]
+                  },
+                  "confidence": { "type": "number" },
+                  "reason": { "type": "string" }
+                }
+              }
+            },
+            "recommendations": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "table": { "type": "string" },
+                  "column": { "type": "string" },
+                  "action": {
+                    "type": "string",
+                    "enum": ["MASK", "EXCLUDE", "FILTER", "ENCRYPT", "NONE"]
+                  },
+                  "detail": { "type": "string" }
+                }
+              }
+            },
+            "existing_roles": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "existing_grants": { "type": "string" }
+          }
+        }
+      validation_prompt: |
+        Does this output contain: (1) a confirmed database name,
+        (2) at least one table with columns listed, (3) a sensitivity
+        classification for each column, (4) protection recommendations?
+        Answer yes only if all four are present. Answer no otherwise.
+        {{output}}
+      retry_policy:
+        max_retries: 1
+
+    # ── Stage 2: Access Design ───────────────────────────────────────
+    # Skill Steps 7–9: Identify roles, design access patterns, assess
+    # ETL impact. Pure reasoning — no database tools needed.
+    - agent_id: nda-access-designer
+      prompt_template: |
+        You are a Teradata security architect inside a PIPELINE WORKFLOW.
+        You receive a discovery report from a prior agent containing
+        database inventory, sensitivity classifications, and protection
+        recommendations. Do NOT ask for clarification — use what is provided.
+
+        Design the access control model:
+        1. IDENTIFY ROLES: Based on the sensitivity matrix, propose roles:
+           - A read-all role (full access, for DBAs/data engineers)
+           - A masked-read role (sensitive columns masked/excluded)
+           - A restricted role (row-filtered + column-filtered)
+           - Map to any existing roles found in the discovery report
+        2. DESIGN ACCESS VIEWS: For each role, specify:
+           - Which columns are visible, masked, or excluded
+           - Row-level filter conditions (WHERE clauses)
+           - View naming convention: v_{table}_{role}
+        3. ASSESS ETL IMPACT: Flag any downstream concerns:
+           - Will masking break JOIN keys?
+           - Are filtered rows needed by aggregate pipelines?
+           - Column type changes from masking functions
+
+        Output a structured access design document.
+
+        Discovery report:
+        {{previous}}
+      validation_prompt: |
+        Does this output define at least one role, at least one access
+        view specification, and address ETL impact? Answer yes or no.
+        {{output}}
+      retry_policy:
+        max_retries: 1
+
+    # ── Stage 3: SQL Generation ──────────────────────────────────────
+    # Skill Step 11: Generate the complete SQL file from the design.
+    # No tools — pure text generation.
+    - agent_id: nda-sql-generator
+      prompt_template: |
+        You are a Teradata SQL specialist inside a PIPELINE WORKFLOW.
+        You receive an access design from a prior agent. Do NOT ask for
+        clarification — generate SQL from what is provided.
+
+        Generate a complete SQL file with FOUR sections:
+
+        SECTION 1 — SETUP SQL (execute in order):
+        - CREATE ROLE statements for each proposed role
+        - GRANT role-to-user/profile statements
+        - CREATE VIEW statements for each access view, including:
+          - Column projection (exclude sensitive columns for restricted roles)
+          - CASE expressions for masking (e.g., '***' || SUBSTR(ssn, -4))
+          - WHERE clauses for row-level filtering
+        - GRANT SELECT on views to appropriate roles
+
+        SECTION 2 — ROLLBACK SQL (reverses Section 1):
+        - REVOKE statements in reverse order
+        - DROP VIEW statements
+        - DROP ROLE statements (only if newly created)
+
+        SECTION 3 — TEST SQL:
+        - For each role, a SET SESSION query + SELECT to verify:
+          - Correct columns visible/hidden
+          - Masking applied correctly
+          - Row filter working
+
+        SECTION 4 — VERIFICATION SQL:
+        - DBC catalog queries to confirm roles, grants, views exist
+
+        Rules:
+        - Use Teradata SQL syntax (not ANSI)
+        - Wrap each section in clear comment headers
+        - Each statement on its own line, terminated with semicolon
+
+        Output ONLY the SQL file content inside a ```sql code block.
+
+        Access design:
+        {{previous}}
+      validation_prompt: |
+        Does this output contain all four sections (SETUP, ROLLBACK,
+        TEST, VERIFICATION) with valid Teradata SQL? Answer yes or no.
+        {{output}}
+      retry_policy:
+        max_retries: 2
+
+      # ── HITL GATE: Human reviews discovery + design + SQL ──────────
+      hitl_gate:
+        prompt_template: |
+          === Data Access SQL Review Required ===
+
+          The following SQL has been generated based on:
+          - Discovery analysis of database schema and sensitivity
+          - Access design with roles, views, and row-level security
+          - ETL impact assessment
+
+          {{output}}
+
+          Actions:
+          - APPROVE: Execute this SQL against the database
+          - REVISE: Send back with feedback for changes
+          - REJECT: Cancel — nothing will be executed
+        request_type: approval
+        timeout_seconds: 3600
+        revise_target_stage_id: nda-sql-generator
+        max_revisions: 3
+        on_timeout: fail
+
+    # ════════════════════════════════════════════════════════════════════
+    # WORKFLOW B — Execution Pipeline (execute_sql + read-only verify)
+    # Covers Skill Steps 13–14: Execute SQL → Validate → Sign-off
+    # ════════════════════════════════════════════════════════════════════
+
+    # ── Stage 4: SQL Execution ───────────────────────────────────────
+    # Skill Step 13: Execute the approved SETUP SQL.
+    # TOOLS: execute_sql + read-only tools for verification.
+    - agent_id: nda-sql-executor
+      prompt_template: |
+        You are a Teradata SQL executor inside a pipeline workflow. The SQL
+        you receive has been reviewed and approved through prior pipeline
+        stages. Execute it immediately.
+
+        CRITICAL TOOL INSTRUCTIONS:
+        - Use execute_sql for ALL DDL/DCL statements (CREATE ROLE, GRANT,
+          CREATE VIEW, REVOKE, DROP). NOT base_readQuery.
+        - base_readQuery only accepts SELECT statements.
+        - Execute ONLY the SETUP section. Do NOT execute ROLLBACK, TEST,
+          or VERIFICATION sections.
+
+        Steps:
+        1. Parse the SETUP SQL section from the input
+        2. Execute each statement one at a time using execute_sql
+        3. After each statement, report success or failure
+        4. If any statement fails, stop and report the error
+        5. After all SETUP statements succeed, report summary
+
+        Approved SQL:
+        {{previous}}
+      pass_full_history: false
+      output_schema: |
+        {
+          "type": "object",
+          "required": ["status", "statements_executed", "statements_failed"],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["success", "partial", "failed"]
+            },
+            "statements_executed": { "type": "integer" },
+            "statements_failed": { "type": "integer" },
+            "results": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "sql": { "type": "string" },
+                  "status": { "type": "string" },
+                  "message": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+
+    # ── Stage 5: Validation & Test ───────────────────────────────────
+    # Skill Step 14: Run test queries and verify everything works.
+    # TOOLS: Read-only only — runs TEST + VERIFICATION SQL sections.
+    - agent_id: nda-test-validator
+      prompt_template: |
+        You are a Teradata security validation analyst with READ-ONLY
+        access. You receive the execution results from a prior agent plus
+        the original SQL file (which contains TEST and VERIFICATION sections).
+
+        Steps:
+        1. Run each VERIFICATION SQL query using base_readQuery to confirm:
+           - Roles exist in DBC.RolesV
+           - Grants exist in DBC.AllRightsV
+           - Views exist in DBC.TablesV
+        2. Run each TEST SQL query using base_readQuery:
+           - Verify correct columns are visible per role
+           - Verify masking is applied (sensitive columns show masked values)
+           - Verify row filtering is working
+        3. Compile a test results report:
+           - PASS/FAIL for each verification check
+           - PASS/FAIL for each role-based test
+           - Any discrepancies or concerns
+        4. Provide a final recommendation: ACCEPT or REMEDIATE
+
+        Previous stage output and SQL:
+        {{previous}}
+      output_schema: |
+        {
+          "type": "object",
+          "required": ["overall_status", "checks"],
+          "properties": {
+            "overall_status": {
+              "type": "string",
+              "enum": ["ACCEPT", "REMEDIATE"]
+            },
+            "checks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "category": { "type": "string" },
+                  "check": { "type": "string" },
+                  "result": { "type": "string", "enum": ["PASS", "FAIL"] },
+                  "detail": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+
+      # ── HITL GATE: Final sign-off ─────────────────────────────────
+      hitl_gate:
+        prompt_template: |
+          === Final Validation Review ===
+
+          All SQL has been executed and validated. Test results:
+
+          {{output}}
+
+          Actions:
+          - APPROVE: Accept — data access onboarding complete
+          - REVISE: Run rollback SQL and start over
+          - REJECT: Run rollback SQL and cancel
+        request_type: approval
+        timeout_seconds: 3600
+        revise_target_stage_id: nda-sql-generator
+        max_revisions: 1
+        on_timeout: fail
