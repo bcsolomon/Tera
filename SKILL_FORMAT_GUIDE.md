@@ -49,13 +49,19 @@ The `SKILL.md` file is required for bundle-style skills. It should have:
 ---
 name: Skill Display Name
 description: One-line description of what the skill does
+metadata:
+  author: username
+  version: "1.0"
 tags:
   - tag1
   - tag2
-created_by: Author Name
-last_updated: 2026-09-15
 ---
 ```
+
+**Required fields:**
+- `name` — The skill identifier/display name
+- `description` — One-line description of what the skill does
+- `metadata` — Must include `author` (username) and `version` (semantic version string)
 
 ### Body (Markdown)
 The body contains the skill documentation including:
