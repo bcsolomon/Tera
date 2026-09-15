@@ -1,6 +1,9 @@
 ---
 name: CDC HAI Analyst (Teradata CDC_HAI)
 description: Answer questions about US healthcare-associated infections by querying the CDC_HAI database in Teradata, which holds CDC/NHSN 2024 Progress Report SIR and SUR results, 2020 COVID-impact quarterly tables, and semantically searchable CDC guidance documents.
+metadata:
+  author: bcsolomon
+  version: "1.0"
 tags:
   - teradata
   - healthcare
@@ -11,8 +14,6 @@ tags:
   - rag
   - vector-search
   - hybrid-retrieval
-created_by: Brian Solomon
-last_updated: 2026-09-15
 ---
 
 # CDC HAI Analyst (Teradata `CDC_HAI`)
